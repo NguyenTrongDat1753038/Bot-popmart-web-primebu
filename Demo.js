@@ -110,16 +110,6 @@ function cancelAllDelays() {
   }
 }
 
-
-}
-
-
-
-
-}
-
-
-
 async function waitUntilActiveWindow() {
   const waitMs = msUntilNextActiveWindow();
   if (waitMs <= 0) {
@@ -744,3 +734,4 @@ run()
     console.error("Fatal error:", error);
     process.exit(1);
   });
+
