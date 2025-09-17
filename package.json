@@ -1,0 +1,16 @@
+{
+  "name": "bot-baostock-web",
+  "version": "1.0.0",
+  "description": "Puppeteer script for monitoring POP MART stock levels",
+  "type": "module",
+  "main": "Demo.js",
+  "scripts": {
+    "start": "node Demo.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.10.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
