@@ -2,13 +2,13 @@
 import fs from "fs/promises";
 import puppeteer from "puppeteer";
 
-function randomDelay(min = 4000, max = 6000) {
+function randomDelay(min = 3000, max = 5000) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
   return delay(ms);
 }
 
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
-const PER_PRODUCT_DELAY = { min: 3000, max: 5000 };
+const PER_PRODUCT_DELAY = { min: 2000, max: 3000 };
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
 const GMT7_OFFSET_MINUTES = 7 * 60;
 const ACTIVE_WINDOW = { startHour: 8, endHour: 21 };
@@ -517,7 +517,7 @@ async function notifyStock(product, skuIndex, stock, skuData) {
   } else if (skuIndex === 1) {
     lines.push(`Restock full set: ${product.name}`);
   } else {
-    lines.push(`Stock alert (SKU #${skuIndex + 1}): ${product.name}`);
+    lines.push(`Restock ship: ${product.name}`);
   }
 
   lines.push(`So luong online: ${stock}`);
@@ -594,9 +594,9 @@ async function run() {
             const previousStock = lastKnownStocks.get(key);
             lastKnownStocks.set(key, stock);
 
-            console.log(
+            /*console.log(
               `[${currentProduct.name}] SKU${index + 1} onlineStock: ${stock}`
-            );
+            );*/
 
             if (stock > 0 && stock !== previousStock) {
               await notifyStock(currentProduct, index, stock, sku);
@@ -634,7 +634,7 @@ async function run() {
         }
 
         currentProduct = product;
-        console.log(`Loading ${product.name} -> ${product.url}`);
+        console.log(`Loading ${product.name}`);
 
         try {
           await page.goto(product.url, { waitUntil: "networkidle2" });
