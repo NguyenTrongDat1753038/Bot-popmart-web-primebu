@@ -598,7 +598,7 @@ async function run() {
               `[${currentProduct.name}] SKU${index + 1} onlineStock: ${stock}`
             );*/
 
-            if (stock > 0 && stock !== previousStock) {
+            if (stock > 0 && stock !== previousStock && index<2) {
               await notifyStock(currentProduct, index, stock, sku);
             }
           }
