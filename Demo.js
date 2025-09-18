@@ -10,6 +10,8 @@ function randomDelay(min = 3000, max = 5000) {
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
 const PER_PRODUCT_DELAY = { min: 2000, max: 3000 };
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
+const DEFAULT_SINGLE_BUY_COUNT = 12;
+const DEFAULT_SET_BUY_COUNT = 2;
 const GMT7_OFFSET_MINUTES = 7 * 60;
 const ACTIVE_WINDOW = { startHour: 8, endHour: 21 };
 const MS_PER_SECOND = 1000;
@@ -345,6 +347,31 @@ function resolveSkuId(product, skuIndex, skuData) {
   return extractSkuIdFromData(skuData);
 }
 
+function resolveVariantKind(product, skuIndex) {
+  if (skuIndex === 0) {
+    if (!product.skuSingleId) {
+      return "set";
+    }
+    return "single";
+  }
+  if (skuIndex === 1) {
+    return "set";
+  }
+  return "other";
+}
+
+function resolveBuyCount(product, skuIndex) {
+  const variantKind = resolveVariantKind(product, skuIndex);
+  if (variantKind === "single") {
+    return product.limitSingle ?? DEFAULT_SINGLE_BUY_COUNT;
+  }
+  if (variantKind === "set") {
+    return product.limitSet ?? DEFAULT_SET_BUY_COUNT;
+  }
+  return 1;
+}
+
+
 function createBuyNowLink(product, skuIndex, skuData) {
   const skuId = resolveSkuId(product, skuIndex, skuData);
   const warningKey = `${product.url}#${skuIndex}`;
@@ -369,12 +396,7 @@ function createBuyNowLink(product, skuIndex, skuData) {
     return null;
   }
 
-  let count = 1;
-  if (skuIndex === 0) {
-    count = 12;
-  } else if (skuIndex === 1) {
-    count = 2;
-  }
+  const count = resolveBuyCount(product, skuIndex);
 
   const params = new URLSearchParams({
     spuId: String(product.spuId),
@@ -425,6 +447,26 @@ function normalizeCsvValue(value) {
   return trimmed;
 }
 
+function parseLimitValue(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(trimmed, 10);
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    return null;
+  }
+
+  return parsed;
+}
+
+
+
 function extractSpuId(url) {
   const match = url.match(/products\/(\d+)/);
   return match ? match[1] : null;
@@ -462,6 +504,8 @@ async function readProducts() {
     "sku_set",
     "sku_set_id"
   );
+  const limitSingleIndex = findHeaderIndex(headers, "limit_single");
+  const limitSetIndex = findHeaderIndex(headers, "limit_set");
 
   if (spIndex === -1 || urlIndex === -1) {
     throw new Error('Products.csv header must contain "sp" and "url" columns.');
@@ -473,6 +517,12 @@ async function readProducts() {
     );
   }
 
+  if (limitSingleIndex === -1 || limitSetIndex === -1) {
+    throw new Error(
+      'Products.csv header must contain "limit_single" and "limit_set" columns.'
+    );
+  }
+
   return rows.slice(1).map((line, index) => {
     const cells = splitCsvRow(line).map(normalizeCsvValue);
     const name = cells[spIndex];
@@ -480,6 +530,9 @@ async function readProducts() {
     const csvSpuId = spuIndex === -1 ? "" : cells[spuIndex];
     const skuSingleId = skuSingleIndex === -1 ? "" : cells[skuSingleIndex];
     const skuSetId = skuSetIndex === -1 ? "" : cells[skuSetIndex];
+    const limitSingleRaw =
+      limitSingleIndex === -1 ? "" : cells[limitSingleIndex];
+    const limitSetRaw = limitSetIndex === -1 ? "" : cells[limitSetIndex];
 
     if (!name || !url) {
       throw new Error(
@@ -502,6 +555,8 @@ async function readProducts() {
       spuId,
       skuSingleId: skuSingleId || null,
       skuSetId: skuSetId || null,
+      limitSingle: parseLimitValue(limitSingleRaw),
+      limitSet: parseLimitValue(limitSetRaw),
       buyNowTitle: deriveBuyNowTitle(url, name),
     };
   });
@@ -511,10 +566,11 @@ const lastKnownStocks = new Map();
 
 async function notifyStock(product, skuIndex, stock, skuData) {
   const lines = [];
+  const variantKind = resolveVariantKind(product, skuIndex);
 
-  if (skuIndex === 0) {
+  if (variantKind === "single") {
     lines.push(`Restock box le: ${product.name}`);
-  } else if (skuIndex === 1) {
+  } else if (variantKind === "set") {
     lines.push(`Restock full set: ${product.name}`);
   } else {
     lines.push(`Restock ship: ${product.name}`);
@@ -598,7 +654,9 @@ async function run() {
               `[${currentProduct.name}] SKU${index + 1} onlineStock: ${stock}`
             );*/
 
-            if (stock > 0 && stock !== previousStock && index<2) {
+            const variantKind = resolveVariantKind(currentProduct, index);
+
+            if (stock > 0 && stock !== previousStock && index < 2 && variantKind !== "other") {
               await notifyStock(currentProduct, index, stock, sku);
             }
           }
