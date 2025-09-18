@@ -8,12 +8,13 @@ function randomDelay(min = 3000, max = 5000) {
 }
 
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
-const PER_PRODUCT_DELAY = { min: 2000, max: 3000 };
+const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
+const PRODUCT_PAGE_TIMEOUT = 5500;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
 const GMT7_OFFSET_MINUTES = 7 * 60;
-const ACTIVE_WINDOW = { startHour: 8, endHour: 21 };
+const ACTIVE_WINDOW = { startHour: 8, endHour: 19 };
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
@@ -119,7 +120,7 @@ async function waitUntilActiveWindow() {
   }
 
   console.log(
-    `Outside monitoring window (08:00-21:00 GMT+7). Waiting ${formatDuration(waitMs)} before resuming.`
+    `Outside monitoring window (08:00-19:00 GMT+7). Waiting ${formatDuration(waitMs)} before resuming.`
   );
   await delay(waitMs);
 }
@@ -336,32 +337,53 @@ function extractSkuIdFromData(skuData) {
 }
 
 function resolveSkuId(product, skuIndex, skuData) {
-  if (skuIndex === 0) {
-    return product.skuSingleId || extractSkuIdFromData(skuData);
+  const variantKind = resolveVariantKind(product, skuIndex, skuData);
+  const derivedSkuId = extractSkuIdFromData(skuData);
+
+  if (variantKind === "single" && product.skuSingleId) {
+    return product.skuSingleId;
   }
 
-  if (skuIndex === 1) {
-    return product.skuSetId || extractSkuIdFromData(skuData);
+  if (variantKind === "set" && product.skuSetId) {
+    return product.skuSetId;
   }
 
-  return extractSkuIdFromData(skuData);
+  return derivedSkuId;
 }
 
-function resolveVariantKind(product, skuIndex) {
+function resolveVariantKind(product, skuIndex, skuData) {
+  const skuId = extractSkuIdFromData(skuData);
+
+  if (skuId) {
+    if (product.skuSingleId && skuId === product.skuSingleId) {
+      return "single";
+    }
+
+    if (product.skuSetId && skuId === product.skuSetId) {
+      return "set";
+    }
+  }
+
+  if (!product.skuSingleId && product.skuSetId) {
+    return "set";
+  }
+
   if (skuIndex === 0) {
     if (!product.skuSingleId) {
       return "set";
     }
     return "single";
   }
+
   if (skuIndex === 1) {
     return "set";
   }
+
   return "other";
 }
 
-function resolveBuyCount(product, skuIndex) {
-  const variantKind = resolveVariantKind(product, skuIndex);
+function resolveBuyCount(product, skuIndex, skuData) {
+  const variantKind = resolveVariantKind(product, skuIndex, skuData);
   if (variantKind === "single") {
     return product.limitSingle ?? DEFAULT_SINGLE_BUY_COUNT;
   }
@@ -370,7 +392,6 @@ function resolveBuyCount(product, skuIndex) {
   }
   return 1;
 }
-
 
 function createBuyNowLink(product, skuIndex, skuData) {
   const skuId = resolveSkuId(product, skuIndex, skuData);
@@ -396,7 +417,7 @@ function createBuyNowLink(product, skuIndex, skuData) {
     return null;
   }
 
-  const count = resolveBuyCount(product, skuIndex);
+  const count = resolveBuyCount(product, skuIndex, skuData);
 
   const params = new URLSearchParams({
     spuId: String(product.spuId),
@@ -566,7 +587,7 @@ const lastKnownStocks = new Map();
 
 async function notifyStock(product, skuIndex, stock, skuData) {
   const lines = [];
-  const variantKind = resolveVariantKind(product, skuIndex);
+  const variantKind = resolveVariantKind(product, skuIndex, skuData);
 
   if (variantKind === "single") {
     lines.push(`Restock box le: ${product.name}`);
@@ -654,7 +675,7 @@ async function run() {
               `[${currentProduct.name}] SKU${index + 1} onlineStock: ${stock}`
             );*/
 
-            const variantKind = resolveVariantKind(currentProduct, index);
+            const variantKind = resolveVariantKind(currentProduct, index, sku);
 
             if (stock > 0 && stock !== previousStock && index < 2 && variantKind !== "other") {
               await notifyStock(currentProduct, index, stock, sku);
@@ -685,7 +706,7 @@ async function run() {
 
         if (!isWithinActiveWindow()) {
           console.log(
-            "Monitoring window closed (outside 08:00-21:00 GMT+7). Pausing until it reopens."
+            "Monitoring window closed (outside 08:00-19:00 GMT+7). Pausing until it reopens."
           );
           endedDueToWindow = true;
           break;
@@ -695,14 +716,23 @@ async function run() {
         console.log(`Loading ${product.name}`);
 
         try {
-          await page.goto(product.url, { waitUntil: "networkidle2" });
+          await page.goto(product.url, {
+            waitUntil: "networkidle2",
+            timeout: PRODUCT_PAGE_TIMEOUT,
+          });
         } catch (error) {
           if (shuttingDown) {
             endedDueToWindow = true;
             break;
           }
 
-          console.error(`Failed to load ${product.url}:`, error);
+          if (error instanceof puppeteer.errors.TimeoutError) {
+            console.warn(
+              `Skipping ${product.name} after ${PRODUCT_PAGE_TIMEOUT}ms without response.`
+            );
+          } else {
+            console.error(`Failed to load ${product.url}:`, error);
+          }
           continue;
         }
 
@@ -792,4 +822,5 @@ run()
     console.error("Fatal error:", error);
     process.exit(1);
   });
+
 
