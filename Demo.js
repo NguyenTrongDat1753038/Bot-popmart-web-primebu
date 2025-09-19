@@ -10,12 +10,12 @@ function randomDelay(min = 3000, max = 5000) {
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
 const DEFAULT_CONCURRENT_CHECKS = 3;
 const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
-const PRODUCT_PAGE_TIMEOUT = 5500;
+const PRODUCT_PAGE_TIMEOUT = 10000;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
 const GMT7_OFFSET_MINUTES = 7 * 60;
-const ACTIVE_WINDOW = { startHour: 8, endHour: 19 };
+const ACTIVE_WINDOW = { startHour: 8, endHour: 22 };
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
@@ -820,6 +820,7 @@ async function run() {
 
   const desiredConcurrency = resolveDesiredConcurrency(DEFAULT_CONCURRENT_CHECKS);
   const targetConcurrency = Math.max(1, Math.min(desiredConcurrency, products.length));
+  let currentConcurrency = Math.min(1, targetConcurrency);
 
   if (targetConcurrency < desiredConcurrency) {
     console.warn(
@@ -827,7 +828,13 @@ async function run() {
     );
   }
 
-  console.log(`Using up to ${targetConcurrency} concurrent checks per pass.`);
+  if (currentConcurrency >= targetConcurrency) {
+    console.log(`Using up to ${targetConcurrency} concurrent checks per pass.`);
+  } else {
+    console.log(
+      `Target concurrency ${targetConcurrency}. Warmup starting with ${currentConcurrency} concurrent check and increasing by 1 after each full pass.`
+    );
+  }
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -849,6 +856,7 @@ async function run() {
       }
 
       const passStartMs = Date.now();
+      const passConcurrencyLimit = Math.min(currentConcurrency, targetConcurrency);
       let endedDueToWindow = false;
       const runningTasks = new Set();
       const taskPromises = [];
@@ -867,7 +875,7 @@ async function run() {
           break;
         }
 
-        while (runningTasks.size >= targetConcurrency && !shuttingDown) {
+        while (runningTasks.size >= passConcurrencyLimit && !shuttingDown) {
           await Promise.race(runningTasks);
         }
 
@@ -908,7 +916,13 @@ async function run() {
       }
 
       const passDurationMs = Date.now() - passStartMs;
-      console.log(`Completed one pass through the product list in ${passDurationMs}ms.`);
+      console.log(`Completed one pass through the product list in ${passDurationMs}ms (limit ${passConcurrencyLimit}).`);
+
+      if (currentConcurrency < targetConcurrency) {
+        currentConcurrency += 1;
+        const nextLimit = Math.min(currentConcurrency, targetConcurrency);
+        console.log(`Increasing allowed concurrency to ${nextLimit}.`);
+      }
 
       await randomDelay();
     }
