@@ -8,6 +8,7 @@ function randomDelay(min = 3000, max = 5000) {
 }
 
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
+const DEFAULT_CONCURRENT_CHECKS = 3;
 const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
 const PRODUCT_PAGE_TIMEOUT = 5500;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
@@ -135,6 +136,8 @@ async function gracefulShutdown() {
   console.log("Shutdown requested. Cleaning up...");
 
   cancelAllDelays();
+  await closeAllPages();
+  await safeCloseBrowser();
 
   await shutdownComplete;
 }
@@ -165,7 +168,7 @@ const activeDelays = new Set();
 
 let shuttingDown = false;
 let browserRef = null;
-let pageRef = null;
+const activePages = new Set();
 let resolveShutdownPromise;
 const shutdownComplete = new Promise((resolve) => {
   resolveShutdownPromise = resolve;
@@ -199,32 +202,50 @@ function parseDotEnv(content) {
   return values;
 }
 
-async function ensureTelegramConfig() {
-  if (telegramConfig.token && telegramConfig.chatId) {
-    return telegramConfig;
+
+let envFileLoaded = false;
+
+async function loadEnvFromFile() {
+  if (envFileLoaded) {
+    return;
   }
 
-  if (telegramConfigLoadAttempted) {
-    return telegramConfig;
-  }
-
-  telegramConfigLoadAttempted = true;
+  envFileLoaded = true;
 
   try {
     const envPath = new URL("./.env", import.meta.url);
     const content = await fs.readFile(envPath, "utf8");
     const values = parseDotEnv(content);
 
-    if (!telegramConfig.token && values.TELEGRAM_BOT_TOKEN) {
-      telegramConfig.token = values.TELEGRAM_BOT_TOKEN.trim();
-    }
-
-    if (!telegramConfig.chatId && values.TELEGRAM_CHAT_ID) {
-      telegramConfig.chatId = values.TELEGRAM_CHAT_ID.trim();
-    }
+    Object.entries(values).forEach(([key, value]) => {
+      if (typeof process.env[key] === "undefined" || process.env[key] === "") {
+        process.env[key] = value;
+      }
+    });
   } catch (error) {
     if (error.code !== "ENOENT") {
-      console.warn("Unable to load .env file for Telegram config:", error);
+      console.warn("Unable to load .env file:", error);
+    }
+  }
+}
+
+
+
+async function ensureTelegramConfig() {
+  if (telegramConfig.token && telegramConfig.chatId) {
+    return telegramConfig;
+  }
+
+  if (!telegramConfigLoadAttempted) {
+    telegramConfigLoadAttempted = true;
+    await loadEnvFromFile();
+
+    if (!telegramConfig.token && process.env.TELEGRAM_BOT_TOKEN) {
+      telegramConfig.token = process.env.TELEGRAM_BOT_TOKEN.trim();
+    }
+
+    if (!telegramConfig.chatId && process.env.TELEGRAM_CHAT_ID) {
+      telegramConfig.chatId = process.env.TELEGRAM_CHAT_ID.trim();
     }
   }
 
@@ -583,6 +604,186 @@ async function readProducts() {
   });
 }
 
+
+function resolveDesiredConcurrency(defaultValue) {
+  const envKeys = [
+    "PRODUCT_CHECK_CONCURRENCY",
+    "CONCURRENT_PRODUCT_CHECKS",
+    "PRODUCT_CHECK_BATCH_SIZE",
+  ];
+
+  for (const key of envKeys) {
+    const rawValue = process.env[key];
+    if (!rawValue) {
+      continue;
+    }
+
+    const parsedValue = Number.parseInt(rawValue, 10);
+    if (Number.isNaN(parsedValue) || parsedValue <= 0) {
+      console.warn(
+        `Ignoring invalid concurrency value for ${key}: ${rawValue}`
+      );
+      continue;
+    }
+
+    return parsedValue;
+  }
+
+  return defaultValue;
+}
+
+function createResponseHandler(product) {
+  return async (response) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    try {
+      const responseUrl = response.url();
+      if (!responseUrl.includes("productDetails?spuId=")) {
+        return;
+      }
+
+      if (product.spuId && !responseUrl.includes(`spuId=${product.spuId}`)) {
+        return;
+      }
+
+      const json = await response.json();
+      const skus = json?.data?.skus;
+
+      if (!Array.isArray(skus)) {
+        return;
+      }
+
+      for (let index = 0; index < skus.length; index += 1) {
+        const sku = skus[index];
+        const stock = sku?.stock?.onlineStock;
+
+        if (typeof stock === "undefined") {
+          continue;
+        }
+
+        const key = `${product.url}#${index}`;
+        const previousStock = lastKnownStocks.get(key);
+        lastKnownStocks.set(key, stock);
+
+        const variantKind = resolveVariantKind(product, index, sku);
+
+        if (
+          stock > 0 &&
+          stock !== previousStock &&
+          index < 2 &&
+          variantKind !== "other"
+        ) {
+          await notifyStock(product, index, stock, sku);
+        }
+      }
+    } catch (error) {
+      // Ignore non-JSON responses or pages that close while downloading.
+    }
+  };
+}
+
+async function safeClosePage(page) {
+  if (!page) {
+    return;
+  }
+
+  activePages.delete(page);
+
+  try {
+    if (typeof page.isClosed === "function" && page.isClosed()) {
+      return;
+    }
+    await page.close({ runBeforeUnload: false });
+  } catch (error) {
+    if (!shuttingDown) {
+      console.warn("Error closing page:", error);
+    }
+  }
+}
+
+async function closeAllPages() {
+  const pages = Array.from(activePages);
+  await Promise.all(pages.map((page) => safeClosePage(page)));
+}
+
+async function safeCloseBrowser() {
+  if (!browserRef) {
+    return;
+  }
+
+  try {
+    await browserRef.close();
+  } catch (error) {
+    if (!shuttingDown) {
+      console.warn("Error closing browser:", error);
+    }
+  } finally {
+    browserRef = null;
+  }
+}
+
+async function checkProduct(product, browser) {
+  if (shuttingDown) {
+    return;
+  }
+
+  let page = null;
+  const responseHandler = createResponseHandler(product);
+
+  try {
+    page = await browser.newPage();
+    activePages.add(page);
+
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    });
+
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+
+    page.on("response", responseHandler);
+
+    console.log(`Loading ${product.name}`);
+
+    await page.goto(product.url, {
+      waitUntil: "networkidle2",
+      timeout: PRODUCT_PAGE_TIMEOUT,
+    });
+
+    if (shuttingDown) {
+      return;
+    }
+
+    await randomDelay(PER_PRODUCT_DELAY.min, PER_PRODUCT_DELAY.max);
+  } catch (error) {
+    if (shuttingDown) {
+      return;
+    }
+
+    if (error instanceof TimeoutError) {
+      console.warn(
+        `Skipping ${product.name} after ${PRODUCT_PAGE_TIMEOUT}ms without response.`
+      );
+    } else {
+      console.error(`Failed to load ${product.url}:`, error);
+    }
+  } finally {
+    if (page) {
+      if (typeof page.off === "function") {
+        page.off("response", responseHandler);
+      } else if (typeof page.removeListener === "function") {
+        page.removeListener("response", responseHandler);
+      }
+    }
+
+    await safeClosePage(page);
+  }
+}
+
 const lastKnownStocks = new Map();
 
 async function notifyStock(product, skuIndex, stock, skuData) {
@@ -612,8 +813,21 @@ async function notifyStock(product, skuIndex, stock, skuData) {
 
 
 async function run() {
+  await loadEnvFromFile();
+
   const products = await readProducts();
   console.log(`Loaded ${products.length} products from Products.csv.`);
+
+  const desiredConcurrency = resolveDesiredConcurrency(DEFAULT_CONCURRENT_CHECKS);
+  const targetConcurrency = Math.max(1, Math.min(desiredConcurrency, products.length));
+
+  if (targetConcurrency < desiredConcurrency) {
+    console.warn(
+      `Reducing concurrency from ${desiredConcurrency} to ${targetConcurrency} to match the number of available products.`
+    );
+  }
+
+  console.log(`Using up to ${targetConcurrency} concurrent checks per pass.`);
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -626,68 +840,6 @@ async function run() {
 
   browserRef = browser;
 
-  const page = await browser.newPage();
-
-  pageRef = page;
-
-  await page.setExtraHTTPHeaders({
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-  });
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  );
-
-  let currentProduct = null;
-
-  page.on("response", async (response) => {
-    if (!currentProduct || shuttingDown) {
-      return;
-    }
-
-    try {
-      const responseUrl = response.url();
-      if (!responseUrl.includes("productDetails?spuId=")) {
-        return;
-      }
-
-      if (
-        currentProduct.spuId &&
-        !responseUrl.includes(`spuId=${currentProduct.spuId}`)
-      ) {
-        return;
-      }
-
-      const json = await response.json();
-      const skus = json?.data?.skus;
-
-      if (Array.isArray(skus)) {
-        for (let index = 0; index < skus.length; index += 1) {
-          const sku = skus[index];
-          const stock = sku?.stock?.onlineStock;
-
-          if (typeof stock !== "undefined") {
-            const key = `${currentProduct.url}#${index}`;
-            const previousStock = lastKnownStocks.get(key);
-            lastKnownStocks.set(key, stock);
-
-            /*console.log(
-              `[${currentProduct.name}] SKU${index + 1} onlineStock: ${stock}`
-            );*/
-
-            const variantKind = resolveVariantKind(currentProduct, index, sku);
-
-            if (stock > 0 && stock !== previousStock && index < 2 && variantKind !== "other") {
-              await notifyStock(currentProduct, index, stock, sku);
-            }
-          }
-        }
-      }
-    } catch (error) {
-      // Ignore non-JSON responses.
-    }
-  });
-
   try {
     while (!shuttingDown) {
       await waitUntilActiveWindow();
@@ -696,7 +848,10 @@ async function run() {
         break;
       }
 
+      const passStartMs = Date.now();
       let endedDueToWindow = false;
+      const runningTasks = new Set();
+      const taskPromises = [];
 
       for (const product of products) {
         if (shuttingDown) {
@@ -712,28 +867,8 @@ async function run() {
           break;
         }
 
-        currentProduct = product;
-        console.log(`Loading ${product.name}`);
-
-        try {
-          await page.goto(product.url, {
-            waitUntil: "networkidle2",
-            timeout: PRODUCT_PAGE_TIMEOUT,
-          });
-        } catch (error) {
-          if (shuttingDown) {
-            endedDueToWindow = true;
-            break;
-          }
-
-          if (error instanceof TimeoutError) {
-            console.warn(
-              `Skipping ${product.name} after ${PRODUCT_PAGE_TIMEOUT}ms without response.`
-            );
-          } else {
-            console.error(`Failed to load ${product.url}:`, error);
-          }
-          continue;
+        while (runningTasks.size >= targetConcurrency && !shuttingDown) {
+          await Promise.race(runningTasks);
         }
 
         if (shuttingDown) {
@@ -741,10 +876,21 @@ async function run() {
           break;
         }
 
-        await randomDelay(PER_PRODUCT_DELAY.min, PER_PRODUCT_DELAY.max);
+        const taskPromise = checkProduct(product, browser)
+          .catch((error) => {
+            if (!shuttingDown) {
+              console.error(`Failed to load ${product.url}:`, error);
+            }
+          })
+          .finally(() => {
+            runningTasks.delete(taskPromise);
+          });
+
+        runningTasks.add(taskPromise);
+        taskPromises.push(taskPromise);
       }
 
-      currentProduct = null;
+      await Promise.all(taskPromises);
 
       if (shuttingDown) {
         break;
@@ -761,40 +907,14 @@ async function run() {
         continue;
       }
 
-      console.log("Completed one pass through the product list.");
-
-      if (shuttingDown) {
-        break;
-      }
+      const passDurationMs = Date.now() - passStartMs;
+      console.log(`Completed one pass through the product list in ${passDurationMs}ms.`);
 
       await randomDelay();
     }
   } finally {
-    currentProduct = null;
-
-    try {
-      if (pageRef) {
-        await pageRef.close();
-      }
-    } catch (error) {
-      if (!shuttingDown) {
-        console.warn("Error closing page:", error);
-      }
-    } finally {
-      pageRef = null;
-    }
-
-    try {
-      if (browserRef) {
-        await browserRef.close();
-      }
-    } catch (error) {
-      if (!shuttingDown) {
-        console.warn("Error closing browser:", error);
-      }
-    } finally {
-      browserRef = null;
-    }
+    await closeAllPages();
+    await safeCloseBrowser();
 
     cancelAllDelays();
 
