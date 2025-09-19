@@ -12,11 +12,13 @@ const PROXY_LIST_PATH = new URL("./Proxy.txt", import.meta.url);
 const DEFAULT_CONCURRENT_CHECKS = 3;
 const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
 const PRODUCT_PAGE_TIMEOUT = 12000;
+const PROXY_LAUNCH_TIMEOUT_MS = 12000;
+const PROXY_LAUNCH_MAX_ATTEMPTS = 3;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
 const GMT7_OFFSET_MINUTES = 7 * 60;
-const ACTIVE_WINDOW = { startHour: 8, endHour: 19 };
+const ACTIVE_WINDOW = { startHour: 0, endHour: 19 };
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
@@ -226,6 +228,8 @@ class ProxySession {
     this.browser = null;
     this.launching = null;
     this.busy = false;
+    this.failed = false;
+    this.lastError = null;
   }
 
   get label() {
@@ -233,6 +237,10 @@ class ProxySession {
   }
 
   async ensureBrowser() {
+    if (this.failed) {
+      throw this.lastError || new Error(`Proxy ${this.label} is unavailable due to repeated failures.`);
+    }
+
     if (this.browser) {
       return this.browser;
     }
@@ -252,23 +260,59 @@ class ProxySession {
     const { host, port, protocol } = this.config;
     const scheme = protocol || "http";
     const proxyTarget = `${scheme}://${host}:${port}`;
+    let lastError = null;
 
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        `--proxy-server=${proxyTarget}`,
-      ],
-    });
+    for (let attempt = 1; attempt <= PROXY_LAUNCH_MAX_ATTEMPTS; attempt += 1) {
+      if (shuttingDown) {
+        const error = new Error("Shutdown in progress");
+        error.code = "SHUTTING_DOWN";
+        this.failed = true;
+        this.lastError = error;
+        throw error;
+      }
 
-    browser.once("disconnected", () => {
-      this.browser = null;
-    });
+      try {
+        const browser = await puppeteer.launch({
+          headless: true,
+          timeout: PROXY_LAUNCH_TIMEOUT_MS,
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            `--proxy-server=${proxyTarget}`,
+          ],
+        });
 
-    this.browser = browser;
-    return browser;
+        browser.once("disconnected", () => {
+          this.browser = null;
+        });
+
+        this.failed = false;
+        this.lastError = null;
+        this.browser = browser;
+        return browser;
+      } catch (error) {
+        lastError = error;
+        const message = typeof error?.message === "string" ? error.message.toLowerCase() : "";
+        const isTimeout =
+          error instanceof TimeoutError || message.includes("timed out") || message.includes("timeout");
+
+        if (isTimeout && attempt < PROXY_LAUNCH_MAX_ATTEMPTS && !shuttingDown) {
+          console.warn(
+            `Proxy ${this.label} timed out after ${PROXY_LAUNCH_TIMEOUT_MS}ms (attempt ${attempt}/${PROXY_LAUNCH_MAX_ATTEMPTS}). Retrying...`
+          );
+          continue;
+        }
+
+        this.failed = true;
+        this.lastError = error;
+        throw error;
+      }
+    }
+
+    this.failed = true;
+    this.lastError = lastError;
+    throw lastError;
   }
 
   async close() {
@@ -343,6 +387,12 @@ class ProxyPool {
 
     session.busy = false;
 
+    if (session.failed) {
+      this._evictSession(session);
+      this._dispatchWaiting();
+      return;
+    }
+
     if (this.closed) {
       session.close().catch(() => {});
       return;
@@ -361,14 +411,64 @@ class ProxyPool {
     }
   }
 
-  _takeAvailable() {
-    if (this.available.length === 0) {
-      return null;
+  _evictSession(session) {
+    if (!session) {
+      return;
     }
 
-    const index = Math.floor(Math.random() * this.available.length);
-    const [session] = this.available.splice(index, 1);
-    return session;
+    this.available = this.available.filter((entry) => entry !== session);
+    this.sessions = this.sessions.filter((entry) => entry !== session);
+
+    if (!shuttingDown) {
+      console.warn(`Removing proxy ${session.label} from pool after repeated failures.`);
+      if (session.lastError) {
+        console.warn(`Last error for proxy ${session.label}:`, session.lastError);
+      }
+    }
+
+    session.close().catch((error) => {
+      if (!shuttingDown) {
+        console.warn(`Error closing proxy session ${session.label}:`, error);
+      }
+    });
+  }
+
+  _dispatchWaiting() {
+    while (this.waitingResolvers.length > 0) {
+      const session = this._takeAvailable();
+      if (!session) {
+        break;
+      }
+
+      if (session.failed) {
+        this._evictSession(session);
+        continue;
+      }
+
+      session.busy = true;
+      const { resolve } = this.waitingResolvers.shift();
+      resolve(session);
+    }
+  }
+
+  _takeAvailable() {
+    while (this.available.length > 0) {
+      const index = Math.floor(Math.random() * this.available.length);
+      const [session] = this.available.splice(index, 1);
+
+      if (!session) {
+        continue;
+      }
+
+      if (session.failed) {
+        this._evictSession(session);
+        continue;
+      }
+
+      return session;
+    }
+
+    return null;
   }
 
   async shutdown() {
@@ -972,10 +1072,12 @@ async function safeCloseAllBrowsers() {
 
 async function checkProduct(product, proxySession) {
   if (shuttingDown) {
-    return;
+    return { success: false, failureReason: "Shutting down" };
   }
 
   let page = null;
+  let success = false;
+  let failureReason = null;
   const responseHandler = createResponseHandler(product);
   const proxyLabel = proxySession?.label ?? "proxy";
 
@@ -1007,21 +1109,25 @@ async function checkProduct(product, proxySession) {
       timeout: PRODUCT_PAGE_TIMEOUT,
     });
 
-    if (shuttingDown) {
-      return;
+    if (!shuttingDown) {
+      await randomDelay(PER_PRODUCT_DELAY.min, PER_PRODUCT_DELAY.max);
+      success = true;
+    } else {
+      failureReason = "Shutting down";
     }
-
-    await randomDelay(PER_PRODUCT_DELAY.min, PER_PRODUCT_DELAY.max);
   } catch (error) {
     if (shuttingDown) {
-      return;
+      failureReason = "Shutting down";
+      return { success: false, failureReason };
     }
 
     if (error instanceof TimeoutError) {
+      failureReason = `Timeout after ${PRODUCT_PAGE_TIMEOUT}ms`;
       console.warn(
         `Skipping ${product.name} via proxy ${proxyLabel} after ${PRODUCT_PAGE_TIMEOUT}ms without response.`
       );
     } else {
+      failureReason = error?.message || "Unknown navigation error";
       console.error(
         `Failed to load ${product.url} via proxy ${proxyLabel}:`,
         error
@@ -1038,6 +1144,117 @@ async function checkProduct(product, proxySession) {
 
     await safeClosePage(page);
   }
+
+  return { success, failureReason };
+}
+
+async function processProductWithProxyRetries(product) {
+  if (!proxyPoolRef) {
+    throw new Error("Proxy pool is not initialized.");
+  }
+
+  const attemptedSessions = new Set();
+  let attempts = 0;
+  let lastFailureReason = null;
+
+  while (!shuttingDown) {
+    const poolSize = proxyPoolRef.size;
+
+    if (poolSize <= 0) {
+      lastFailureReason = lastFailureReason || "No proxies available in the pool";
+      break;
+    }
+
+    const currentPoolSize = poolSize;
+
+    for (const session of Array.from(attemptedSessions)) {
+      if (!proxyPoolRef.sessions.includes(session)) {
+        attemptedSessions.delete(session);
+      }
+    }
+
+    if (attemptedSessions.size >= currentPoolSize) {
+      break;
+    }
+
+    let session = null;
+    try {
+      session = await proxyPoolRef.acquire();
+    } catch (error) {
+      if (!shuttingDown) {
+        console.error("Failed to acquire proxy session:", error);
+      }
+      lastFailureReason = error?.message || "Unable to acquire proxy session";
+      break;
+    }
+
+    if (currentPoolSize > 1 && attemptedSessions.has(session)) {
+      proxyPoolRef.release(session);
+      continue;
+    }
+
+    attemptedSessions.add(session);
+    attempts += 1;
+
+    let result;
+    try {
+      result = await checkProduct(product, session);
+    } catch (error) {
+      result = { success: false, failureReason: error?.message || String(error) };
+      if (!shuttingDown) {
+        console.error(
+          `Unexpected error while loading ${product.url} via proxy ${session?.label ?? "proxy"}:`,
+          error
+        );
+      }
+    } finally {
+      if (session) {
+        if (proxyPoolRef) {
+          proxyPoolRef.release(session);
+        } else {
+          try {
+            await session.close();
+          } catch (closeError) {
+            if (!shuttingDown) {
+              console.warn(
+                `Error closing proxy session ${session?.label ?? "proxy"}:`,
+                closeError
+              );
+            }
+          }
+        }
+      }
+    }
+
+    if (result?.success) {
+      if (!shuttingDown && attempts > 1) {
+        console.log(
+          `Loaded ${product.name} successfully after ${attempts} proxy attempts.`
+        );
+      }
+      return true;
+    }
+
+    lastFailureReason = result?.failureReason || lastFailureReason;
+
+    const remainingCapacity = proxyPoolRef.size;
+    if (!shuttingDown && remainingCapacity > attemptedSessions.size) {
+      console.log(
+        `Retrying ${product.name} with a different proxy (attempt ${attempts + 1}).`
+      );
+    }
+  }
+
+  if (!shuttingDown) {
+    const attemptsText =
+      attempts === 0
+        ? `No proxy attempts could be made for ${product.name}.`
+        : `Exhausted ${attempts} proxy attempt${attempts === 1 ? "" : "s"} for ${product.name}.`;
+    const reasonText = lastFailureReason ? ` Last error: ${lastFailureReason}.` : "";
+    console.warn(`${attemptsText}${reasonText}`);
+  }
+
+  return false;
 }
 
 const lastKnownStocks = new Map();
@@ -1167,37 +1384,7 @@ async function run() {
             return;
           }
 
-          let session = null;
-
-          try {
-            session = await proxyPoolRef.acquire();
-          } catch (error) {
-            if (!shuttingDown) {
-              console.error("Failed to acquire proxy session:", error);
-            }
-            return;
-          }
-
-          try {
-            await checkProduct(product, session);
-          } finally {
-            if (session) {
-              if (proxyPoolRef) {
-                proxyPoolRef.release(session);
-              } else {
-                try {
-                  await session.close();
-                } catch (closeError) {
-                  if (!shuttingDown) {
-                    console.warn(
-                      `Error closing proxy session ${session.label}:`,
-                      closeError
-                    );
-                  }
-                }
-              }
-            }
-          }
+          await processProductWithProxyRetries(product);
         })().catch((error) => {
           if (!shuttingDown) {
             console.error(
@@ -1207,7 +1394,8 @@ async function run() {
           }
         });
 
-        const taskPromise = execution.finally(() => {
+        let taskPromise;
+        taskPromise = execution.finally(() => {
           runningTasks.delete(taskPromise);
         });
 
@@ -1274,8 +1462,6 @@ run()
     console.error("Fatal error:", error);
     process.exit(1);
   });
-
-
 
 
 
