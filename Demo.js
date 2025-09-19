@@ -1,6 +1,6 @@
 // install: npm install puppeteer
 import fs from "fs/promises";
-import puppeteer from "puppeteer";
+import puppeteer, { TimeoutError } from "puppeteer";
 
 function randomDelay(min = 3000, max = 5000) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
@@ -726,7 +726,7 @@ async function run() {
             break;
           }
 
-          if (error instanceof puppeteer.errors.TimeoutError) {
+          if (error instanceof TimeoutError) {
             console.warn(
               `Skipping ${product.name} after ${PRODUCT_PAGE_TIMEOUT}ms without response.`
             );
