@@ -5,7 +5,7 @@
   "type": "module",
   "main": "Demo.js",
   "scripts": {
-    "start": "node Demo.js"
+    "start": "node Bot-MultipleProxy.js"
   },
   "dependencies": {
     "puppeteer": "^22.10.0"
