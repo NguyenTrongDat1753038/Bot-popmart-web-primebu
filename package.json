@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "Puppeteer script for monitoring POP MART stock levels",
   "type": "module",
-  "main": "Demo.js",
+  "main": "Bot-SystemProxy.js",
   "scripts": {
-    "start": "node Bot-MultipleProxy.js"
+    "start": "node Bot-SystemProxy.js"
   },
   "dependencies": {
     "puppeteer": "^22.10.0"

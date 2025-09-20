@@ -9,8 +9,8 @@ function randomDelay(min = 3000, max = 5000) {
 
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
 const DEFAULT_CONCURRENT_CHECKS = 3;
-const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
-const PRODUCT_PAGE_TIMEOUT = 10000;
+const PER_PRODUCT_DELAY = { min: 1000, max: 3000 };
+const PRODUCT_PAGE_TIMEOUT = 12500;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
