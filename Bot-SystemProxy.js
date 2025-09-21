@@ -2,24 +2,147 @@
 import fs from "fs/promises";
 import puppeteer, { TimeoutError } from "puppeteer";
 
-function randomDelay(min = 3000, max = 5000) {
+function randomDelay(min = 2000, max = 5000) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
   return delay(ms);
 }
 
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
 const DEFAULT_CONCURRENT_CHECKS = 3;
-const PER_PRODUCT_DELAY = { min: 1000, max: 3000 };
+const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
 const PRODUCT_PAGE_TIMEOUT = 12500;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
+const isRailwayEnvironment = Boolean(
+  process.env.RAILWAY_ENVIRONMENT ||
+  process.env.RAILWAY_ENVIRONMENT_NAME ||
+  process.env.RAILWAY_PROJECT_ID ||
+  process.env.RAILWAY_STATIC_URL ||
+  process.env.RAILWAY_PUBLIC_DOMAIN
+);
+const DEFAULT_ACTIVE_WINDOW_SPECS = isRailwayEnvironment
+  ? ["07:30-09:30", "18:00-19:30"]
+  : ["09:30-18:00"];
+const DEFAULT_ACTIVE_WINDOW_SUMMARY = DEFAULT_ACTIVE_WINDOW_SPECS.join(", ");
 const GMT7_OFFSET_MINUTES = 7 * 60;
-const ACTIVE_WINDOW = { startHour: 8, endHour: 19 };
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
 const DAY_IN_MS = 24 * MS_PER_HOUR;
+
+let activeWindows = [];
+let activeWindowSummary = "";
+let activeWindowsInitialized = false;
+
+function formatMinutesAsTime(minutes) {
+  const normalized = ((minutes % (24 * 60)) + 24 * 60) % (24 * 60);
+  const hours = Math.floor(normalized / 60);
+  const mins = normalized % 60;
+  return `${hours.toString().padStart(2, "0")}:${mins.toString().padStart(2, "0")}`;
+}
+
+function parseTimeToMinutes(value) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!match) {
+    throw new Error(`Invalid time value "${value}". Expected HH:MM.`);
+  }
+  const hours = Number.parseInt(match[1], 10);
+  const minutes = Number.parseInt(match[2], 10);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    throw new Error(`Time "${value}" is out of range.`);
+  }
+  return hours * 60 + minutes;
+}
+
+function parseActiveWindows(rawValue) {
+  const specs =
+    rawValue && rawValue.trim().length > 0
+      ? rawValue.split(/[,;]+/)
+      : DEFAULT_ACTIVE_WINDOW_SPECS;
+
+  const parsed = [];
+
+  for (const spec of specs) {
+    const trimmed = spec.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const parts = trimmed.split("-");
+    if (parts.length !== 2) {
+      throw new Error(`Invalid window spec "${trimmed}". Expected START-END.`);
+    }
+
+    const startMinutes = parseTimeToMinutes(parts[0]);
+    const endMinutes = parseTimeToMinutes(parts[1]);
+
+    if (endMinutes <= startMinutes) {
+      throw new Error(
+        `End time must be after start time in window "${trimmed}".`
+      );
+    }
+
+    parsed.push({ startMinutes, endMinutes });
+  }
+
+  if (parsed.length === 0) {
+    throw new Error("No valid active windows provided.");
+  }
+
+  parsed.sort((a, b) => a.startMinutes - b.startMinutes);
+
+  const merged = [];
+  for (const window of parsed) {
+    const last = merged[merged.length - 1];
+    if (last && window.startMinutes <= last.endMinutes) {
+      last.endMinutes = Math.max(last.endMinutes, window.endMinutes);
+    } else {
+      merged.push({ ...window });
+    }
+  }
+
+  return merged.map((window) => ({
+    startMinutes: window.startMinutes,
+    endMinutes: window.endMinutes,
+    startMs: window.startMinutes * MS_PER_MINUTE,
+    endMs: window.endMinutes * MS_PER_MINUTE,
+  }));
+}
+
+function initializeActiveWindows(force = false) {
+  if (activeWindowsInitialized && !force) {
+    return;
+  }
+
+  try {
+    activeWindows = parseActiveWindows(process.env.ACTIVE_WINDOWS || "");
+  } catch (error) {
+    if (process.env.ACTIVE_WINDOWS) {
+      console.warn(
+        `Invalid ACTIVE_WINDOWS configuration "${process.env.ACTIVE_WINDOWS}". Falling back to default ${DEFAULT_ACTIVE_WINDOW_SUMMARY}.`
+      );
+      console.warn(error.message);
+    }
+    activeWindows = parseActiveWindows("");
+  }
+
+  activeWindowSummary = activeWindows
+    .map(
+      (window) =>
+        `${formatMinutesAsTime(window.startMinutes)}-${formatMinutesAsTime(
+          window.endMinutes
+        )}`
+    )
+    .join(", ");
+
+  activeWindowsInitialized = true;
+}
+
+function getActiveWindowSummary() {
+  initializeActiveWindows();
+  return activeWindowSummary;
+}
 
 function getNowInGmt7() {
   const now = new Date();
@@ -37,26 +160,29 @@ function getMsSinceStartOfDay(date) {
 }
 
 function isWithinActiveWindow(date = getNowInGmt7()) {
+  initializeActiveWindows();
   const msSinceStart = getMsSinceStartOfDay(date);
-  const startMs = ACTIVE_WINDOW.startHour * MS_PER_HOUR;
-  const endMs = ACTIVE_WINDOW.endHour * MS_PER_HOUR;
-  return msSinceStart >= startMs && msSinceStart < endMs;
+  return activeWindows.some(
+    (window) => msSinceStart >= window.startMs && msSinceStart < window.endMs
+  );
 }
 
 function msUntilNextActiveWindow(date = getNowInGmt7()) {
+  initializeActiveWindows();
   const msSinceStart = getMsSinceStartOfDay(date);
-  const startMs = ACTIVE_WINDOW.startHour * MS_PER_HOUR;
-  const endMs = ACTIVE_WINDOW.endHour * MS_PER_HOUR;
 
-  if (msSinceStart < startMs) {
-    return startMs - msSinceStart;
+  for (const window of activeWindows) {
+    if (msSinceStart >= window.startMs && msSinceStart < window.endMs) {
+      return 0;
+    }
+
+    if (msSinceStart < window.startMs) {
+      return window.startMs - msSinceStart;
+    }
   }
 
-  if (msSinceStart >= startMs && msSinceStart < endMs) {
-    return 0;
-  }
-
-  return DAY_IN_MS - msSinceStart + startMs;
+  const firstWindow = activeWindows[0];
+  return DAY_IN_MS - msSinceStart + firstWindow.startMs;
 }
 
 function formatDuration(ms) {
@@ -121,7 +247,7 @@ async function waitUntilActiveWindow() {
   }
 
   console.log(
-    `Outside monitoring window (08:00-19:00 GMT+7). Waiting ${formatDuration(waitMs)} before resuming.`
+    `Outside monitoring window (${getActiveWindowSummary()} GMT+7). Waiting ${formatDuration(waitMs)} before resuming.`
   );
   await delay(waitMs);
 }
@@ -815,6 +941,10 @@ async function notifyStock(product, skuIndex, stock, skuData) {
 async function run() {
   await loadEnvFromFile();
 
+  initializeActiveWindows(true);
+  const windowSummary = getActiveWindowSummary();
+  console.log(`Active monitoring windows (GMT+7): ${windowSummary}.`);
+
   const products = await readProducts();
   console.log(`Loaded ${products.length} products from Products.csv.`);
 
@@ -869,7 +999,7 @@ async function run() {
 
         if (!isWithinActiveWindow()) {
           console.log(
-            "Monitoring window closed (outside 08:00-19:00 GMT+7). Pausing until it reopens."
+            `Monitoring window closed (outside ${getActiveWindowSummary()} GMT+7). Pausing until it reopens.`
           );
           endedDueToWindow = true;
           break;
@@ -956,5 +1086,3 @@ run()
     console.error("Fatal error:", error);
     process.exit(1);
   });
-
-
