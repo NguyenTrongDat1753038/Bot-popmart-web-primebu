@@ -15,6 +15,10 @@ const PRODUCT_PAGE_TIMEOUT = 12000;
 const PROXY_LAUNCH_TIMEOUT_MS = 12000;
 const PROXY_LAUNCH_MAX_ATTEMPTS = 3;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
+const POPMART_BLOCK_PATTERNS = [
+  "ban dang truy cap qua thuong xuyen",
+  "mot so tinh nang da bi han che",
+];
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
 const GMT7_OFFSET_MINUTES = 7 * 60;
@@ -79,6 +83,31 @@ function formatDuration(ms) {
   }
   return parts.join(" ") || "0s";
 }
+function normalizeForMatch(value) {
+  if (!value) {
+    return "";
+  }
+
+  return value
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function isPopmartBlockPage(html) {
+  if (!html) {
+    return false;
+  }
+
+  const normalized = normalizeForMatch(html);
+  if (!normalized) {
+    return false;
+  }
+
+  return POPMART_BLOCK_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
 
 async function delay(ms) {
   if (ms <= 0) {
@@ -512,6 +541,7 @@ let telegramConfigLoadAttempted = false;
 const buyNowWarningKeys = new Set();
 const activeDelays = new Set();
 
+let popmartBlockHandled = false;
 let shuttingDown = false;
 let proxyPoolRef = null;
 const activePages = new Set();
@@ -1070,6 +1100,31 @@ async function safeCloseAllBrowsers() {
   }
 }
 
+async function handlePopmartBlock(product) {
+  if (popmartBlockHandled) {
+    return;
+  }
+
+  popmartBlockHandled = true;
+
+  console.error(
+    "Detected Pop Mart block page while loading " + product.name + ". Initiating shutdown."
+  );
+
+  const messageLines = [
+    "[ALERT] Pop Mart da gioi han truy cap bot.",
+    "San pham: " + product.name,
+    "URL: " + product.url,
+    "Thoi gian: " + new Date().toISOString(),
+  ];
+
+  await sendTelegramMessage(messageLines.join("\n"));
+
+  gracefulShutdown().catch((error) => {
+    console.error("Error during shutdown after Pop Mart block:", error);
+  });
+}
+
 async function checkProduct(product, proxySession) {
   if (shuttingDown) {
     return { success: false, failureReason: "Shutting down" };
@@ -1110,6 +1165,13 @@ async function checkProduct(product, proxySession) {
     });
 
     if (!shuttingDown) {
+      const pageHtml = await page.content();
+      if (isPopmartBlockPage(pageHtml)) {
+        failureReason = "Pop Mart block detected";
+        await handlePopmartBlock(product);
+        return { success: false, failureReason };
+      }
+
       await randomDelay(PER_PRODUCT_DELAY.min, PER_PRODUCT_DELAY.max);
       success = true;
     } else {
@@ -1320,7 +1382,7 @@ async function run() {
     1,
     Math.min(desiredConcurrency, products.length, availableProxyCount)
   );
-  let currentConcurrency = Math.min(1, targetConcurrency);
+  let currentConcurrency = Math.min(3, targetConcurrency);
 
   if (targetConcurrency < desiredConcurrency) {
     if (constraints.length > 0) {

@@ -2,16 +2,20 @@
 import fs from "fs/promises";
 import puppeteer, { TimeoutError } from "puppeteer";
 
-function randomDelay(min = 2000, max = 5000) {
+function randomDelay(min = 4000, max = 6000) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
   return delay(ms);
 }
 
 const PRODUCTS_CSV_PATH = new URL("./Products.csv", import.meta.url);
 const DEFAULT_CONCURRENT_CHECKS = 3;
-const PER_PRODUCT_DELAY = { min: 1000, max: 2500 };
+const PER_PRODUCT_DELAY = { min: 2000, max: 4000 };
 const PRODUCT_PAGE_TIMEOUT = 12500;
 const ORDER_CONFIRMATION_URL = "https://www.popmart.com/vn/order-confirmation";
+const POPMART_BLOCK_PATTERNS = [
+  "ban dang truy cap qua thuong xuyen",
+  "mot so tinh nang da bi han che",
+];
 const DEFAULT_SINGLE_BUY_COUNT = 12;
 const DEFAULT_SET_BUY_COUNT = 2;
 const isRailwayEnvironment = Boolean(
@@ -202,6 +206,31 @@ function formatDuration(ms) {
   }
   return parts.join(" ") || "0s";
 }
+function normalizeForMatch(value) {
+  if (!value) {
+    return "";
+  }
+
+  return value
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function isPopmartBlockPage(html) {
+  if (!html) {
+    return false;
+  }
+
+  const normalized = normalizeForMatch(html);
+  if (!normalized) {
+    return false;
+  }
+
+  return POPMART_BLOCK_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
 
 async function delay(ms) {
   if (ms <= 0) {
@@ -292,6 +321,7 @@ let telegramConfigLoadAttempted = false;
 const buyNowWarningKeys = new Set();
 const activeDelays = new Set();
 
+let popmartBlockHandled = false;
 let shuttingDown = false;
 let browserRef = null;
 const activePages = new Set();
@@ -850,6 +880,31 @@ async function safeCloseBrowser() {
   }
 }
 
+async function handlePopmartBlock(product) {
+  if (popmartBlockHandled) {
+    return;
+  }
+
+  popmartBlockHandled = true;
+
+  console.error(
+    "Detected Pop Mart block page while loading " + product.name + ". Initiating shutdown."
+  );
+
+  const messageLines = [
+    "[ALERT] Pop Mart da gioi han truy cap bot.",
+    "San pham: " + product.name,
+    "URL: " + product.url,
+    "Thoi gian: " + new Date().toISOString(),
+  ];
+
+  await sendTelegramMessage(messageLines.join("\n"));
+
+  gracefulShutdown().catch((error) => {
+    console.error("Error during shutdown after Pop Mart block:", error);
+  });
+}
+
 async function checkProduct(product, browser) {
   if (shuttingDown) {
     return;
@@ -879,6 +934,14 @@ async function checkProduct(product, browser) {
       waitUntil: "networkidle2",
       timeout: PRODUCT_PAGE_TIMEOUT,
     });
+
+    if (!shuttingDown) {
+      const pageHtml = await page.content();
+      if (isPopmartBlockPage(pageHtml)) {
+        await handlePopmartBlock(product);
+        return;
+      }
+    }
 
     if (shuttingDown) {
       return;
@@ -950,7 +1013,7 @@ async function run() {
 
   const desiredConcurrency = resolveDesiredConcurrency(DEFAULT_CONCURRENT_CHECKS);
   const targetConcurrency = Math.max(1, Math.min(desiredConcurrency, products.length));
-  let currentConcurrency = Math.min(1, targetConcurrency);
+  let currentConcurrency = Math.min(3, targetConcurrency);
 
   if (targetConcurrency < desiredConcurrency) {
     console.warn(
