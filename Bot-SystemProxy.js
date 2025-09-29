@@ -26,8 +26,8 @@ const isRailwayEnvironment = Boolean(
   process.env.RAILWAY_PUBLIC_DOMAIN
 );
 const DEFAULT_ACTIVE_WINDOW_SPECS = isRailwayEnvironment
-  ? ["07:30-09:30", "18:00-19:30"]
-  : ["09:30-18:00"];
+  ? ["07:30-08:30", "18:00-19:30"]
+  : ["08:30-18:00"];
 const DEFAULT_ACTIVE_WINDOW_SUMMARY = DEFAULT_ACTIVE_WINDOW_SPECS.join(", ");
 const GMT7_OFFSET_MINUTES = 7 * 60;
 const MS_PER_SECOND = 1000;
